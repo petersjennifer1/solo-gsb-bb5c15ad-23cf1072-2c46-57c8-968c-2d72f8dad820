@@ -31,12 +31,21 @@
   两孔坐标与实际净距。冲突时不生成展开 SVG、禁止下载，反查待确认结果
   无法确认、排版方案不可用。反查按「加入现有孔位后的全集」判定，
   排版按「替换后的方案」判定。
+- A4 分页定位模板：把合法展开结果按实际毫米 1:1 排到纵向 A4 页
+  （210×297mm，四边留白 10mm，可打印区 190×277mm，相邻页重叠 15mm），
+  按原纸尺寸计算覆盖全纸的分页窗口（窗口从原纸左下角起排，列自左而右、
+  行自下而上，与原纸坐标方向一致），逐页裁剪纸边、折痕、保护区与孔圆，
+  跨页图形在相邻页各保留对应片段，全程不缩放。每页标注行列号、原纸窗口
+  坐标与重叠区对位十字，全部页面连同打印拼接说明打包为 ZIP 下载；
+  分页入口复用孔位/保护区/纸桥校验，违规时拒绝下载。
 """
 
 from __future__ import annotations
 
+import io
 import math
 import os
+import zipfile
 
 from flask import Flask, jsonify, render_template, request, Response
 
@@ -393,6 +402,246 @@ def bridge_conflict_info(hole_a, hole_b, clearance):
 
 
 # ---------------------------------------------------------------------------
+# A4 分页定位模板（纵向 A4，1:1 实际毫米，不缩放）
+# ---------------------------------------------------------------------------
+A4_W = 210.0                        # mm，纵向 A4 宽
+A4_H = 297.0                        # mm，纵向 A4 高
+A4_MARGIN = 10.0                    # mm，四边留白
+A4_OVERLAP = 15.0                   # mm，相邻页重叠
+A4_PRINT_W = A4_W - 2 * A4_MARGIN               # 190mm，可打印区宽
+A4_PRINT_H = A4_H - 2 * A4_MARGIN               # 277mm，可打印区高
+A4_STEP_X = A4_PRINT_W - A4_OVERLAP             # 175mm，列步进
+A4_STEP_Y = A4_PRINT_H - A4_OVERLAP             # 262mm，行步进
+
+
+def a4_page_layout(width, height):
+    """按原纸尺寸计算覆盖全纸的 A4 分页窗口。
+
+    窗口从原纸左下角 (0,0) 起排：列自左而右、行自下而上（与原纸坐标方向
+    一致）。每页窗口即该页可打印区（190×277mm）在原纸上的覆盖范围，
+    相邻页窗口恰好重叠 15mm；末列/末行窗口可越出原纸（该页只画纸面部分）。
+    """
+    cols = max(1, math.ceil((width - A4_PRINT_W) / A4_STEP_X - 1e-9) + 1)
+    rows = max(1, math.ceil((height - A4_PRINT_H) / A4_STEP_Y - 1e-9) + 1)
+    windows = []
+    for row in range(rows):
+        for col in range(cols):
+            x0 = col * A4_STEP_X
+            y0 = row * A4_STEP_Y
+            windows.append({"col": col, "row": row, "x0": x0, "y0": y0,
+                            "x1": x0 + A4_PRINT_W, "y1": y0 + A4_PRINT_H})
+    return {"cols": cols, "rows": rows, "pages": cols * rows,
+            "windows": windows}
+
+
+def _a4_cross(cx, cy):
+    """重叠区对位十字（蓝色）：5mm 十字 + 小圆，相邻页同一原纸坐标各画一次。"""
+    a = 2.5
+    return (f'<g stroke="#2563eb" stroke-width="0.3" fill="none">'
+            f'<line x1="{cx - a:.3f}" y1="{cy:.3f}" x2="{cx + a:.3f}" '
+            f'y2="{cy:.3f}"/>'
+            f'<line x1="{cx:.3f}" y1="{cy - a:.3f}" x2="{cx:.3f}" '
+            f'y2="{cy + a:.3f}"/>'
+            f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="1.2"/></g>\n')
+
+
+def build_a4_page_svg(width, height, holes, creases, zones, radius,
+                      layout, win):
+    """单页 A4 分页定位模板 SVG（纵向 A4，1:1 mm，不缩放）。
+
+    原纸点 (px, py)（左下角原点、y 向上）映射到页面 SVG 坐标
+    (10 + px - wx0, 287 - (py - wy0))；纸边、折痕、保护区与孔圆统一由
+    clipPath 裁到本页可打印窗口，跨页图形在相邻页各保留对应片段。
+    只写入与本页窗口相交的图形（裁剪结果不变，文件更小）。
+    """
+    col, row = win["col"], win["row"]
+    wx0, wy0, wx1, wy1 = win["x0"], win["y0"], win["x1"], win["y1"]
+
+    def X(px):
+        return A4_MARGIN + px - wx0
+
+    def Y(py):
+        return A4_H - A4_MARGIN - (py - wy0)
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n',
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'width="{A4_W:.0f}mm" height="{A4_H:.0f}mm" '
+        f'viewBox="0 0 {A4_W:.3f} {A4_H:.3f}">\n',
+        f'<desc>A4 分页定位模板：第 {row + 1} 行 第 {col + 1} 列'
+        f'（共 {layout["rows"]} 行 × {layout["cols"]} 列）；'
+        f'原纸窗口 x {wx0:g} ~ {wx1:g}mm，y {wy0:g} ~ {wy1:g}mm'
+        '（原点为原纸左下角，y 轴向上）</desc>\n',
+        f'<rect x="0" y="0" width="{A4_W:.3f}" height="{A4_H:.3f}" '
+        'fill="#ffffff"/>\n',
+        # 可打印区边界（裁切/核对参考）
+        f'<rect x="{A4_MARGIN:.3f}" y="{A4_MARGIN:.3f}" '
+        f'width="{A4_PRINT_W:.3f}" height="{A4_PRINT_H:.3f}" '
+        'fill="none" stroke="#94a3b8" stroke-width="0.25" '
+        'stroke-dasharray="3 2"/>\n',
+        # 裁剪窗口：纸边、折痕、保护区、孔圆一律裁到本页可打印区
+        f'<clipPath id="pg"><rect x="{A4_MARGIN:.3f}" y="{A4_MARGIN:.3f}" '
+        f'width="{A4_PRINT_W:.3f}" height="{A4_PRINT_H:.3f}"/></clipPath>\n',
+        '<g clip-path="url(#pg)">\n',
+        # 纸边（原纸矩形，越出窗口的部分被裁掉）
+        f'<rect x="{X(0.0):.3f}" y="{Y(height):.3f}" width="{width:.3f}" '
+        f'height="{height:.3f}" fill="#ffffff" stroke="#1f2937" '
+        'stroke-width="0.35"/>\n',
+    ]
+    eps = 1e-9
+    for c in creases:
+        if c["orient"] == "v":
+            if not (wx0 - eps <= c["pos"] <= wx1 + eps):
+                continue
+            parts.append(
+                f'<line x1="{X(c["pos"]):.3f}" y1="{Y(0.0):.3f}" '
+                f'x2="{X(c["pos"]):.3f}" y2="{Y(height):.3f}" '
+                'stroke="#9ca3af" stroke-width="0.2" stroke-dasharray="2 1.5"/>\n')
+        else:
+            if not (wy0 - eps <= c["pos"] <= wy1 + eps):
+                continue
+            parts.append(
+                f'<line x1="{X(0.0):.3f}" y1="{Y(c["pos"]):.3f}" '
+                f'x2="{X(width):.3f}" y2="{Y(c["pos"]):.3f}" '
+                'stroke="#9ca3af" stroke-width="0.2" stroke-dasharray="2 1.5"/>\n')
+    for zi, z in enumerate(zones):
+        if (z["x"] + z["w"] < wx0 - eps or z["x"] > wx1 + eps
+                or z["y"] + z["h"] < wy0 - eps or z["y"] > wy1 + eps):
+            continue
+        parts.append(
+            f'<rect x="{X(z["x"]):.3f}" y="{Y(z["y"] + z["h"]):.3f}" '
+            f'width="{z["w"]:.3f}" height="{z["h"]:.3f}" '
+            'fill="#16a34a" fill-opacity="0.10" stroke="#15803d" '
+            'stroke-width="0.4" stroke-dasharray="2.5 1.8"/>\n')
+        if z["w"] >= 8.0 and z["h"] >= 4.5:
+            parts.append(
+                f'<text x="{X(z["x"]) + 1.0:.3f}" '
+                f'y="{Y(z["y"] + z["h"]) + 3.4:.3f}" '
+                f'font-size="3" fill="#15803d">保{zi + 1}</text>\n')
+    r = float(radius)
+    for hp in holes:
+        if (hp["x"] + r < wx0 - eps or hp["x"] - r > wx1 + eps
+                or hp["y"] + r < wy0 - eps or hp["y"] - r > wy1 + eps):
+            continue
+        parts.append(_circle(X(hp["x"]), Y(hp["y"]), r))
+    parts.append('</g>\n')
+
+    # 重叠区边界（琥珀色点线）与对位十字（蓝色）：只画存在邻页的方向。
+    # 十字位于重叠区中线的 1/3、2/3 处，相邻页在同一原纸坐标各画一次。
+    crosses = []
+    if col > 0:                     # 左邻页：本页左侧 15mm 为重叠区
+        parts.append(
+            f'<line x1="{A4_MARGIN + A4_OVERLAP:.3f}" y1="{A4_MARGIN:.3f}" '
+            f'x2="{A4_MARGIN + A4_OVERLAP:.3f}" y2="{A4_H - A4_MARGIN:.3f}" '
+            'stroke="#d97706" stroke-width="0.3" stroke-dasharray="1.5 1.5"/>\n')
+        crosses.append((A4_MARGIN + A4_OVERLAP / 2,
+                        A4_MARGIN + A4_PRINT_H / 3))
+        crosses.append((A4_MARGIN + A4_OVERLAP / 2,
+                        A4_MARGIN + 2 * A4_PRINT_H / 3))
+    if col < layout["cols"] - 1:    # 右邻页：本页右侧 15mm 为重叠区
+        parts.append(
+            f'<line x1="{A4_MARGIN + A4_STEP_X:.3f}" y1="{A4_MARGIN:.3f}" '
+            f'x2="{A4_MARGIN + A4_STEP_X:.3f}" y2="{A4_H - A4_MARGIN:.3f}" '
+            'stroke="#d97706" stroke-width="0.3" stroke-dasharray="1.5 1.5"/>\n')
+        crosses.append((A4_MARGIN + A4_PRINT_W - A4_OVERLAP / 2,
+                        A4_MARGIN + A4_PRINT_H / 3))
+        crosses.append((A4_MARGIN + A4_PRINT_W - A4_OVERLAP / 2,
+                        A4_MARGIN + 2 * A4_PRINT_H / 3))
+    if row > 0:                     # 下邻页：本页下侧 15mm 为重叠区
+        parts.append(
+            f'<line x1="{A4_MARGIN:.3f}" '
+            f'y1="{A4_H - A4_MARGIN - A4_OVERLAP:.3f}" '
+            f'x2="{A4_W - A4_MARGIN:.3f}" '
+            f'y2="{A4_H - A4_MARGIN - A4_OVERLAP:.3f}" '
+            'stroke="#d97706" stroke-width="0.3" stroke-dasharray="1.5 1.5"/>\n')
+        crosses.append((A4_MARGIN + A4_PRINT_W / 3,
+                        A4_H - A4_MARGIN - A4_OVERLAP / 2))
+        crosses.append((A4_MARGIN + 2 * A4_PRINT_W / 3,
+                        A4_H - A4_MARGIN - A4_OVERLAP / 2))
+    if row < layout["rows"] - 1:    # 上邻页：本页上侧 15mm 为重叠区
+        parts.append(
+            f'<line x1="{A4_MARGIN:.3f}" y1="{A4_MARGIN + A4_OVERLAP:.3f}" '
+            f'x2="{A4_W - A4_MARGIN:.3f}" y2="{A4_MARGIN + A4_OVERLAP:.3f}" '
+            'stroke="#d97706" stroke-width="0.3" stroke-dasharray="1.5 1.5"/>\n')
+        crosses.append((A4_MARGIN + A4_PRINT_W / 3,
+                        A4_MARGIN + A4_OVERLAP / 2))
+        crosses.append((A4_MARGIN + 2 * A4_PRINT_W / 3,
+                        A4_MARGIN + A4_OVERLAP / 2))
+    for cx, cy in crosses:
+        parts.append(_a4_cross(cx, cy))
+
+    # 页眉：行列号 + 原纸窗口坐标；页脚：打印与拼接说明
+    seq = row * layout["cols"] + col + 1
+    parts.append(
+        f'<text x="{A4_MARGIN:.3f}" y="5.6" font-size="3.4" fill="#0f172a">'
+        f'A4 分页定位模板 · 第 {row + 1} 行 第 {col + 1} 列'
+        f'（共 {layout["rows"]} 行 × {layout["cols"]} 列，'
+        f'第 {seq}/{layout["pages"]} 页；行自下而上、列自左而右）</text>\n')
+    parts.append(
+        f'<text x="{A4_MARGIN:.3f}" y="9.2" font-size="2.8" fill="#334155">'
+        f'原纸窗口：x {wx0:g} ~ {wx1:g} mm，y {wy0:g} ~ {wy1:g} mm'
+        '（坐标原点为原纸左下角，y 轴向上）</text>\n')
+    parts.append(
+        f'<text x="{A4_MARGIN:.3f}" y="293.6" font-size="2.8" fill="#334155">'
+        f'原纸 {width:g} × {height:g} mm · 孔 {len(holes)} 个 · '
+        '按 100% 比例打印（勿缩放）；琥珀色点线侧为 15mm 重叠区，'
+        '蓝色十字与邻页对位拼接</text>\n')
+    parts.append('</svg>\n')
+    return "".join(parts)
+
+
+def a4_readme_text(width, height, radius, hole_count, layout):
+    """ZIP 内的打印与拼接说明（纯文本）。"""
+    return (
+        "A4 分页定位模板 · 打印与拼接说明\n"
+        "================================\n"
+        "\n"
+        f"原纸尺寸：{width:g} × {height:g} mm；打孔半径 {radius:g} mm；"
+        f"孔数 {hole_count} 个。\n"
+        f"分页：共 {layout['pages']} 页（{layout['rows']} 行 × "
+        f"{layout['cols']} 列），文件名 a4_page_r{{行}}_c{{列}}.svg；"
+        "行号自下而上、列号自左而右，与原纸左下角坐标系一致。\n"
+        "分页参数：纵向 A4（210 × 297 mm），四边留白 10 mm，"
+        "可打印区 190 × 277 mm，相邻页重叠 15 mm，"
+        "全程 1:1 实际毫米，未缩放。\n"
+        "\n"
+        "打印\n"
+        "----\n"
+        "1. 务必按 100% 比例（实际大小）打印：关闭「适应页面」"
+        "「缩放至可打印区域」等选项。\n"
+        "2. 打印后可用直尺核对：可打印区虚线框应为 190 × 277 mm，"
+        "否则说明打印时被缩放，拼接会错位。\n"
+        "\n"
+        "拼接\n"
+        "----\n"
+        "1. 每页页眉标有「第 R 行 第 C 列」与原纸窗口坐标"
+        "（坐标原点为原纸左下角，y 轴向上）。\n"
+        "2. 同行相邻页左右重叠 15 mm：把右页左缘的蓝色对位十字"
+        "与左页右缘的对位十字重合（同一原纸坐标）。\n"
+        "3. 同列相邻页上下重叠 15 mm：行号大的页在上方，同样对齐对位十字。\n"
+        "4. 建议从第 1 行（最下一行）开始，逐行向上、每行自左而右拼接，"
+        "即还原整张原纸。\n"
+        "5. 图例：琥珀色点线 = 重叠区边界（距可打印区边缘 15 mm）；"
+        "灰虚线 = 折痕；绿色虚线框 = 保护区；红圆 = 孔位；"
+        "蓝色十字 = 重叠区对位标记。\n"
+    )
+
+
+def build_a4_zip(width, height, holes, creases, zones, radius):
+    """把全部 A4 分页 SVG 与打印拼接说明打包为 ZIP（内存字节）。"""
+    layout = a4_page_layout(width, height)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for win in layout["windows"]:
+            name = f"a4_page_r{win['row'] + 1}_c{win['col'] + 1}.svg"
+            zf.writestr(name, build_a4_page_svg(
+                width, height, holes, creases, zones, radius, layout, win))
+        zf.writestr("README.txt", a4_readme_text(
+            width, height, radius, len(holes), layout))
+    return buf.getvalue(), layout
+
+
+# ---------------------------------------------------------------------------
 # SVG 生成
 # ---------------------------------------------------------------------------
 def _svg_header(w_mm, h_mm):
@@ -646,6 +895,9 @@ def compute(payload):
     folded_svg, pad, vb_w, vb_h = build_folded_svg(
         w, h, edges, mm_pts, radius, error_idx)
 
+    # A4 分页窗口只依赖纸张尺寸，违规时同样返回（页面据此显示页数）
+    a4 = a4_page_layout(width, height)
+
     return {
         "ok": True,
         "folded": {
@@ -657,9 +909,14 @@ def compute(payload):
             "svg": folded_svg,
         },
         "creases": creases,
+        "holes": holes,
         "holeCount": len(holes),
         "expectedCount": len(mm_pts) * (2 ** len(folds)),
         "unfoldedSvg": unfolded_svg,
+        "a4Pages": {"cols": a4["cols"], "rows": a4["rows"],
+                    "pages": a4["pages"],
+                    "printWidth": A4_PRINT_W, "printHeight": A4_PRINT_H,
+                    "margin": A4_MARGIN, "overlap": A4_OVERLAP},
         "error": error_msg,
         "errorIndex": error_idx,
         "zoneError": zone_error,
@@ -990,6 +1247,33 @@ def api_download():
         mimetype="image/svg+xml",
         headers={"Content-Disposition":
                  'attachment; filename="unfolded.svg"'})
+
+
+@app.route("/api/download-a4", methods=["POST"])
+def api_download_a4():
+    """A4 分页定位模板：合法展开结果 1:1 排到纵向 A4 页，打包 ZIP 下载。
+
+    与 /api/download 同一入口校验（孔位/保护区/纸桥净距），违规时拒绝下载。
+    """
+    payload = request.get_json(force=True, silent=True)
+    if payload is None:
+        return _bad("请求不是合法 JSON")
+    try:
+        result = compute(payload)
+    except ValueError as exc:
+        return _bad(str(exc))
+    if result["error"] or not result["unfoldedSvg"]:
+        return _bad(result["error"] or "存在不合法孔位，无法生成分页模板")
+    # compute 已通过全部校验，此处取回纸张尺寸与保护区用于逐页裁剪
+    width, height, radius, _folds, _min_bridge = _validate_sheet(payload)
+    zones = _validate_zones(payload)
+    data, _layout = build_a4_zip(width, height, result["holes"],
+                                 result["creases"], zones, radius)
+    return Response(
+        data,
+        mimetype="application/zip",
+        headers={"Content-Disposition":
+                 'attachment; filename="a4-pages.zip"'})
 
 
 @app.route("/healthz")

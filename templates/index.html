@@ -135,7 +135,7 @@
 <body>
 <header>
   <h1>纸张对折打孔 · 展开预览</h1>
-  <p>设定纸张与折法 → 在最终折叠面上点击打孔（或开启「反查打孔」直接在展开图上点目标孔心，或在左侧「目标孔位排版」逐行录入目标孔心自动生成方案）→ 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。可划定原纸保护区，孔圆触碰保护区即禁止生成展开图；也可设定最小纸桥宽度（0 表示关闭），任意两孔圆边净距小于该值即冲突，冲突时不生成展开图、禁止下载。</p>
+  <p>设定纸张与折法 → 在最终折叠面上点击打孔（或开启「反查打孔」直接在展开图上点目标孔心，或在左侧「目标孔位排版」逐行录入目标孔心自动生成方案）→ 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。可划定原纸保护区，孔圆触碰保护区即禁止生成展开图；也可设定最小纸桥宽度（0 表示关闭），任意两孔圆边净距小于该值即冲突，冲突时不生成展开图、禁止下载。合法展开结果可下载为 SVG，或打包为 A4 分页定位模板 ZIP（纵向 A4、1:1 实际毫米、四边留白 10mm、相邻页重叠 15mm，每页标注行列号、原纸窗口坐标与重叠区对位十字，按 100% 比例打印后拼接）。</p>
 </header>
 
 <div class="layout">
@@ -255,10 +255,13 @@
       </div>
       <div class="toolbar">
         <button type="button" id="btnDownload" class="primary" disabled>下载展开 SVG</button>
+        <button type="button" id="btnDownloadA4" disabled
+                title="把合法展开结果按实际毫米 1:1 排到纵向 A4 页并打包 ZIP">下载 A4 分页模板 (ZIP)</button>
         <button type="button" id="btnReverse"
                 title="在展开图上点击目标孔心，系统按当前折法反查折叠面打孔位置">反查打孔：关</button>
         <span class="hint" id="downloadHint"></span>
       </div>
+      <p class="hint" id="a4Hint"></p>
       <p class="hint" id="reverseHint"></p>
       <div class="toolbar" id="reverseBar" style="display:none">
         <button type="button" id="btnConfirmReverse" class="primary">确认加入打孔点</button>
@@ -435,6 +438,14 @@
       "<b>" + f.layers + "</b> 层；折叠面尺寸 <b>" + f.width + " × " + f.height +
       "</b> mm。蓝虚线为折痕边，黑实线为纸张开口边。";
 
+    // A4 分页页数（只依赖纸张尺寸，违规时也显示；按钮仍受校验结果控制）
+    if (d.a4Pages) {
+      $("a4Hint").textContent = "A4 分页定位模板：共 " + d.a4Pages.pages +
+        " 页（" + d.a4Pages.cols + " 列 × " + d.a4Pages.rows + " 行）· " +
+        "纵向 A4 · 1:1 实际毫米 · 四边留白 10mm · 相邻页重叠 15mm，" +
+        "按 100% 比例打印后依重叠区对位十字拼接。";
+    }
+
     // 展开图
     var wrap = $("unfoldedSvgWrap");
     if (d.error) {
@@ -459,8 +470,9 @@
 
   // 排版方案预览期间禁止下载（视图显示的是方案，不是当前打孔点）
   function updateDownloadBtn() {
-    $("btnDownload").disabled =
-      !!planPreview || !lastResult || !!lastResult.error;
+    var blocked = !!planPreview || !lastResult || !!lastResult.error;
+    $("btnDownload").disabled = blocked;
+    $("btnDownloadA4").disabled = blocked;
   }
 
   // 折叠面重绘（含反查预览标记）
@@ -1017,6 +1029,31 @@
         var a = document.createElement("a");
         a.href = URL.createObjectURL(blob);
         a.download = "unfolded.svg";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+      });
+    }).catch(function () { setStatus("err", "下载失败：网络错误。"); });
+  });
+
+  // A4 分页定位模板：与展开 SVG 同一校验入口，违规时服务端拒绝下载
+  $("btnDownloadA4").addEventListener("click", function () {
+    if ($("btnDownloadA4").disabled) return;
+    fetch("/api/download-a4", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state)
+    }).then(function (resp) {
+      if (!resp.ok) {
+        return resp.json().then(function (d) {
+          setStatus("err", d.error || "无法生成 A4 分页模板。");
+        });
+      }
+      return resp.blob().then(function (blob) {
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "a4-pages.zip";
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
