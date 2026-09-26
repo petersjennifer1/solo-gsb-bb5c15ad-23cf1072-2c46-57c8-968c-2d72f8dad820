@@ -31,12 +31,21 @@
   两孔坐标与实际净距。冲突时不生成展开 SVG、禁止下载，反查待确认结果
   无法确认、排版方案不可用。反查按「加入现有孔位后的全集」判定，
   排版按「替换后的方案」判定。
+- A4 分页定位模板：合法展开结果可另行打包为纵向 A4（210×297mm）分页
+  SVG 的 ZIP。按实际毫米 1:1 排位（不缩放），四边留白 10mm、相邻页
+  物理重叠 15mm；按原纸尺寸计算覆盖全纸的分页窗口，每页用裁剪路径裁切
+  纸边、折痕、保护区与孔圆，跨页图形在相邻页各自保留窗口内片段；每页
+  标注页号/行列号（行号自下而上，与原纸左下角原点方向一致）、原纸窗口
+  mm 坐标与重叠区对位十字（相邻页同坐标各画一份，打印后重合对齐）。
+  分页入口与展开图下载共用全部孔位/保护区/纸桥校验，任一违规即拒绝。
 """
 
 from __future__ import annotations
 
+import io
 import math
 import os
+import zipfile
 
 from flask import Flask, jsonify, render_template, request, Response
 
@@ -60,6 +69,15 @@ MAX_BRIDGE = MAX_DIM    # mm，最小纸桥宽度上限
 EDGE_TOL = 0.05         # mm，边界判定容差（浮点误差 + 必须严格在内侧）
 ROUND_TRIP_TOL = 1e-6   # mm，归一化坐标往返（mm -> 归一化 -> mm）的浮点误差宽限：
                         # 反查/排版给出的孔心确认后重算时，不被同一校验误拒
+
+# A4 纵向分页定位模板（单位 mm，实际毫米 1:1，绝不缩放）
+A4_W = 210.0
+A4_H = 297.0
+A4_MARGIN = 10.0        # 页面四边留白
+A4_OVERLAP = 15.0       # 相邻页物理重叠宽度
+A4_STEP_X = A4_W - 2 * A4_MARGIN - A4_OVERLAP   # x 向相邻窗口步进 175mm
+A4_STEP_Y = A4_H - 2 * A4_MARGIN - A4_OVERLAP   # y 向相邻窗口步进 262mm
+A4_MAX_PAGES = 128      # 分页上限（2000×2000mm 原纸最多 12×8=96 页）
 
 ALLOWED_FOLDS = ("vL", "vR", "hT", "hB")
 EDGE_NAMES = {
@@ -492,6 +510,465 @@ def build_folded_svg(w, h, edges, points, radius, error_idx):
 
 
 # ---------------------------------------------------------------------------
+# A4 纵向分页定位模板（实际 mm 1:1，不缩放）
+# ---------------------------------------------------------------------------
+def a4_windows(width, height):
+    """按原纸尺寸计算覆盖全纸的分页窗口（原纸 mm 坐标，原点左下角）。
+
+    纵向 A4 页四边留白 A4_MARGIN，每页可承载窗口 A4_STEP×277mm；相邻窗口
+    步进 = 内容跨度 - A4_OVERLAP，最后一个窗口吸附到纸张另一边，保证末端
+    实际重叠恰为 15mm 且窗口不越出纸张。返回
+    {cols, rows, pages: [{col, row, x0, y0, x1, y1, overlap:{...}}]}，
+    行列号均从 1 起，第 1 行对应原纸最下一行（与左下角坐标方向一致）。
+    """
+    def starts(size, span, step):
+        # 一张纸放得下时不分页（窗口吸附到 0，末端留白属正常）
+        if size <= span + 1e-9:
+            return [0.0]
+        # 步进 step = 内容跨度 - 重叠；n 个窗口覆盖长度 = span + (n-1)*step
+        n = 1 + max(1, math.ceil((size - span - 1e-9) / step))
+        xs = [i * step for i in range(n - 1)]
+        last = size - span
+        if not xs:
+            xs.append(last)
+        elif last <= xs[-1]:
+            # 末窗与前窗重叠不足时退化为吸附（极小尺寸，理论上极少触发）
+            xs[-1] = last
+        else:
+            xs.append(last)
+        return xs
+
+    span_x = A4_W - 2 * A4_MARGIN
+    span_y = A4_H - 2 * A4_MARGIN
+    xs = starts(float(width), span_x, A4_STEP_X)
+    ys = starts(float(height), span_y, A4_STEP_Y)
+    pages = []
+    for ri, y0 in enumerate(ys):
+        for ci, x0 in enumerate(xs):
+            x1 = min(x0 + span_x, float(width))
+            y1 = min(y0 + span_y, float(height))
+            pages.append({"col": ci + 1, "row": ri + 1,
+                          "x0": round(x0, 6), "y0": round(y0, 6),
+                          "x1": round(x1, 6), "y1": round(y1, 6)})
+    return {"cols": len(xs), "rows": len(ys),
+            "pages": pages, "spanX": span_x, "spanY": span_y}
+
+
+def _mark_positions(lo, hi, gap=60.0, inset=22.0):
+    """重叠区内对位十字的坐标位置（沿拼缝方向）。
+
+    距两端 inset 处各一枚，中间每隔 gap 一枚；带段过短时在中点保留一枚，
+    保证任何重叠片段上都有可对位标记。坐标以原纸 mm 计（翻转组内坐标）。
+    """
+    if hi - lo < 2 * inset + gap * 0.5:
+        return [round((lo + hi) / 2.0, 3)]
+    pos = [lo + inset]
+    v = lo + inset + gap
+    while v < hi - inset - 1e-9:
+        pos.append(round(v, 3))
+        v += gap
+    pos.append(round(hi - inset, 3))
+    return pos
+
+
+def _seg_rect(ax, ay, bx, by, x0, y0, x1, y1):
+    """Liang–Barsky 线段与轴对齐窗口求交；返回窗口内线段端点或 None。"""
+    t0, t1, dx, dy = 0.0, 1.0, bx - ax, by - ay
+    for p, q in ((-dx, ax - x0), (dx, x1 - ax),
+                 (-dy, ay - y0), (dy, y1 - ay)):
+        if abs(p) < 1e-12:
+            if q < 0.0:
+                return None
+        else:
+            r = q / p
+            if p < 0.0:
+                if r > t1:
+                    return None
+                t0 = max(t0, r)
+            else:
+                if r < t0:
+                    return None
+                t1 = min(t1, r)
+    return ax + t0 * dx, ay + t0 * dy, ax + t1 * dx, ay + t1 * dy
+
+
+def _circle_clipped_page_path(cx, cy, r, x0, y0, x1, y1, gx, gy):
+    """圆与轴对齐窗口求交，返回页坐标系下的闭合填充路径（或 None）。
+
+    做法：圆盘 ∩ 矩形是凸集。沿圆周采样「圆与四条边的交点」角度，再补入
+    落在圆内的窗口角点（角点角），按数学角排序后顺时针遍历——相邻事件间
+    的圆弧中点在窗口内就走圆弧，否则走直线（直线只会沿同一条窗口边：跨
+    边之间必然隔着圆内的角点事件）。圆完全在窗内给整圆、完全包含窗口给
+    矩形。输出坐标为页内 mm：px = gx + X - x0，py = gy + (y1 - Y)。
+    """
+    TWO_PI = 2.0 * math.pi
+    corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+    def page(x, y):
+        return gx + x - x0, gy + (y1 - y)
+
+    # 圆完全位于窗口内 -> 整圆（页坐标下两段半圆弧，sweep=0 为顺时针）
+    if cx - r >= x0 - 1e-9 and cx + r <= x1 + 1e-9 \
+            and cy - r >= y0 - 1e-9 and cy + r <= y1 + 1e-9:
+        acx, acy = page(cx, cy)
+        return (f"M {acx - r:.3f},{acy:.3f} "
+                f"a {r:.3f},{r:.3f} 0 1,0 {2 * r:.3f},0 "
+                f"a {r:.3f},{r:.3f} 0 1,0 {-2 * r:.3f},0 Z")
+
+    # 圆完全包含窗口 -> 交集就是窗口矩形
+    if all(math.hypot(qx - cx, qy - cy) <= r + 1e-9 for qx, qy in corners):
+        ax, ay = page(x0, y1)
+        return (f"M {ax:.3f},{ay:.3f} h {x1 - x0:.3f} v {y1 - y0:.3f} "
+                f"h {-(x1 - x0):.3f} Z")
+
+    angles = []
+
+    def add_angle(a, qx, qy):
+        # 用真实交点坐标重算角度，避免边界相切时 asin/acos 漂移
+        a = math.atan2(qy - cy, qx - cx) % TWO_PI
+        for ea, _, _ in angles:
+            d = abs(a - ea) % TWO_PI
+            if min(d, TWO_PI - d) < 1e-7:
+                return
+        angles.append((a, qx, qy))
+
+    # 圆与左/右边界直线（保留线段范围内的交点）
+    for bx in (x0, x1):
+        rem = r * r - (bx - cx) ** 2
+        if rem >= 0.0:
+            k = math.sqrt(max(0.0, rem))
+            for qy in (cy + k, cy - k):
+                if y0 - 1e-9 <= qy <= y1 + 1e-9:
+                    add_angle(math.atan2(qy - cy, bx - cx),
+                              bx, min(y1, max(y0, qy)))
+    # 圆与下/上边界直线
+    for by in (y0, y1):
+        rem = r * r - (by - cy) ** 2
+        if rem >= 0.0:
+            k = math.sqrt(max(0.0, rem))
+            for qx in (cx + k, cx - k):
+                if x0 - 1e-9 <= qx <= x1 + 1e-9:
+                    add_angle(math.atan2(by - cy, qx - cx),
+                              min(x1, max(x0, qx)), by)
+
+    # 落在圆内的窗口角点（严格在内）：作为直线边界的转折点
+    for qx, qy in corners:
+        if math.hypot(qx - cx, qy - cy) < r - 1e-7:
+            add_angle(math.atan2(qy - cy, qx - cx), qx, qy)
+
+    angles.sort(key=lambda e: e[0])
+    if len(angles) < 2:
+        return None
+
+    def in_win(x, y):
+        return x0 - 1e-7 <= x <= x1 + 1e-7 and y0 - 1e-7 <= y <= y1 + 1e-7
+
+    d = []
+    n = len(angles)
+    for i in range(n):
+        a1, sx, sy = angles[i]
+        a2, ex, ey = angles[(i + 1) % n]
+        if a2 <= a1:
+            a2 += TWO_PI
+        am = (a1 + a2) / 2.0
+        mx = cx + r * math.cos(am)
+        my = cy + r * math.sin(am)
+        psx, psy = page(sx, sy)
+        pex, pey = page(ex, ey)
+        if i == 0:
+            d.append(f"M {psx:.3f},{psy:.3f}")
+        if in_win(mx, my):
+            # 圆内弧：页坐标 y 已翻转，顺时针遍历对应 sweep-flag = 1
+            large = 1 if a2 - a1 > math.pi else 0
+            d.append(f"A {r:.3f},{r:.3f} 0 {large},1 {pex:.3f},{pey:.3f}")
+        else:
+            # 窗外段沿窗口边直线（相邻事件必在同一条边上，角点已在列表中）
+            d.append(f"L {pex:.3f},{pey:.3f}")
+    d.append("Z")
+    return " ".join(d)
+
+
+def build_a4_page_svg(page, paging, width, height, holes, creases, radius,
+                      nv, nh, zones, seq, total):
+    """单张纵向 A4 分页 SVG（实际 mm 1:1）。
+
+    页面 210×297mm、四边留白 10mm；原纸 mm 坐标（原点左下角、y 向上）到
+    页内 SVG 坐标（原点左上角、y 向下）直接换算：
+        px = MARGIN + (X - x0)， py = MARGIN + (y1 - Y)
+    所有图形在服务端预先与本页窗口求交（线段裁切、圆裁为圆弧+窗口边的
+    闭合路径、矩形求交），输出不依赖 clipPath/transform，保证浏览器、
+    打印与常见 SVG 渲染器结果一致；跨页图形在相邻页各留窗口内片段。
+    重叠区做浅色底纹，在拼缝两侧页同一原纸坐标各画一枚对位十字；
+    标注文字始终正向可读。
+    """
+    span_x = paging["spanX"]
+    span_y = paging["spanY"]
+    x0, y0, x1, y1 = page["x0"], page["y0"], page["x1"], page["y1"]
+    cw, ch = x1 - x0, y1 - y0                       # 窗口映射到页内的宽高
+    gx, gy = A4_MARGIN, A4_MARGIN                   # 内容框在页上的位置
+    col, row = page["col"], page["row"]
+
+    # 原纸 mm -> 页内 SVG mm（y 翻转）
+    def px(x):
+        return gx + x - x0
+
+    def py(y):
+        return gy + (y1 - y)
+
+    # 与四邻窗口的实际重叠区间（原纸 mm）：末窗吸附会使相邻窗口重叠大于
+    # 15mm，对位十字与底纹必须按两窗真实相交区域绘制，且相邻页用同一组
+    # 原始数据计算，坐标天然一致、可重合对位。
+    by_pos = {(p["col"], p["row"]): p for p in paging["pages"]}
+    seams = []
+    left = by_pos.get((col - 1, row))
+    if left:
+        seams.append(("v", (x0, left["x1"]), (y0, y1)))
+    right = by_pos.get((col + 1, row))
+    if right:
+        seams.append(("v", (right["x0"], x1), (y0, y1)))
+    below = by_pos.get((col, row - 1))
+    if below:
+        seams.append(("h", (y0, below["y1"]), (x0, x1)))
+    above = by_pos.get((col, row + 1))
+    if above:
+        seams.append(("h", (above["y0"], y1), (x0, x1)))
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'width="{A4_W:.3f}mm" height="{A4_H:.3f}mm" '
+        f'viewBox="0 0 {A4_W:.3f} {A4_H:.3f}">\n'
+        '<title>A4 分页定位模板 '
+        f'第 {seq} 页（共 {total} 页），列 {col}/{paging["cols"]}，'
+        f'行 {row}/{paging["rows"]}，自下而上</title>\n'
+        # 整页白底（打印时不会透出底色）
+        f'<rect x="0" y="0" width="{A4_W:.3f}" height="{A4_H:.3f}" '
+        'fill="#ffffff"/>\n'
+        # 页内可打印区域参考框
+        f'<rect x="{A4_MARGIN:.3f}" y="{A4_MARGIN:.3f}" '
+        f'width="{A4_W - 2 * A4_MARGIN:.3f}" '
+        f'height="{A4_H - 2 * A4_MARGIN:.3f}" '
+        'fill="none" stroke="#e2e8f0" stroke-width="0.15"/>\n'
+        # 窗口内纸面底色（仅本页窗口大小，即纸边范围内）
+        f'<rect x="{gx:.3f}" y="{gy:.3f}" width="{cw:.3f}" height="{ch:.3f}" '
+        'fill="#fdfdfb"/>\n'
+    ]
+
+    # 重叠区浅色底纹：左右拼缝（淡蓝）、上下拼缝（淡绿），按实际相交区间
+    # 绘制。用显式浅色而非 fill-opacity，避免不同打印/渲染通道对透明度的
+    # 处理差异；底色很淡，不影响孔圆、折痕等图形判读
+    for kind, s_range, t_range in seams:
+        s_lo, s_hi = s_range
+        t_lo, t_hi = t_range
+        color = "#dbeafe" if kind == "v" else "#dcfce7"
+        edge = "#93c5fd" if kind == "v" else "#86efac"
+        if kind == "v":
+            parts.append(
+                f'<rect x="{px(s_lo):.3f}" y="{py(t_hi):.3f}" '
+                f'width="{s_hi - s_lo:.3f}" height="{t_hi - t_lo:.3f}" '
+                f'fill="{color}" stroke="{edge}" stroke-width="0.12" '
+                'stroke-dasharray="1.2 1.2"/>\n')
+        else:
+            parts.append(
+                f'<rect x="{px(t_lo):.3f}" y="{py(s_hi):.3f}" '
+                f'width="{t_hi - t_lo:.3f}" height="{s_hi - s_lo:.3f}" '
+                f'fill="{color}" stroke="{edge}" stroke-width="0.12" '
+                'stroke-dasharray="1.2 1.2"/>\n')
+
+    # 折痕（灰虚线）：与窗口求交后绘制，跨页折痕在相邻页保留对应片段
+    for c in creases:
+        if c["orient"] == "v":
+            seg = _seg_rect(c["pos"], y0, c["pos"], y1, x0, y0, x1, y1)
+            if seg:
+                ax, ay, bx, by_ = seg
+                parts.append(
+                    f'<line x1="{px(ax):.3f}" y1="{py(ay):.3f}" '
+                    f'x2="{px(bx):.3f}" y2="{py(by_):.3f}" '
+                    'stroke="#9ca3af" stroke-width="0.2" '
+                    'stroke-dasharray="2 1.5"/>\n')
+        else:
+            seg = _seg_rect(x0, c["pos"], x1, c["pos"], x0, y0, x1, y1)
+            if seg:
+                ax, ay, bx, by_ = seg
+                parts.append(
+                    f'<line x1="{px(ax):.3f}" y1="{py(ay):.3f}" '
+                    f'x2="{px(bx):.3f}" y2="{py(by_):.3f}" '
+                    'stroke="#9ca3af" stroke-width="0.2" '
+                    'stroke-dasharray="2 1.5"/>\n')
+
+    # 保护区（绿色半透明 + 虚线框）：与窗口求交；序号按可见片段大小标注
+    for zi, z in enumerate(zones):
+        zx0, zy0 = max(z["x"], x0), max(z["y"], y0)
+        zx1, zy1 = min(z["x"] + z["w"], x1), min(z["y"] + z["h"], y1)
+        if zx1 - zx0 <= 0 or zy1 - zy0 <= 0:
+            continue
+        parts.append(
+            f'<rect x="{px(zx0):.3f}" y="{py(zy1):.3f}" '
+            f'width="{zx1 - zx0:.3f}" height="{zy1 - zy0:.3f}" '
+            'fill="#dcfce7" stroke="#15803d" '
+            'stroke-width="0.4" stroke-dasharray="2.5 1.8"/>\n')
+        if zx1 - zx0 >= 8.0 and zy1 - zy0 >= 4.5:
+            parts.append(
+                f'<text x="{px(zx0) + 1.0:.3f}" y="{py(zy1) + 3.4:.3f}" '
+                f'font-size="3" fill="#15803d">保{zi + 1}</text>\n')
+
+    # 孔圆（红）：预先与窗口求交，跨页时绘制圆与窗口相交的片段路径
+    for hp in holes:
+        d = _circle_clipped_page_path(
+            hp["x"], hp["y"], radius, x0, y0, x1, y1, gx, gy)
+        if d:
+            parts.append(
+                f'<path d="{d}" fill="#dc2626" stroke="#7f1d1d" '
+                'stroke-width="0.12"/>\n')
+
+    # 对位十字（紫，位于重叠带中线）：相邻页同原纸坐标各画一份，打印后重合
+    for kind, s_range, t_range in seams:
+        s_lo, s_hi = s_range
+        sc = (s_lo + s_hi) / 2.0
+        for m in _mark_positions(t_range[0], t_range[1]):
+            if kind == "v":
+                cx, cy = px(sc), py(m)
+            else:
+                cx, cy = px(m), py(sc)
+            parts.append(
+                f'<line x1="{cx - 2.5:.3f}" y1="{cy:.3f}" '
+                f'x2="{cx + 2.5:.3f}" y2="{cy:.3f}" '
+                'stroke="#7c3aed" stroke-width="0.35"/>\n'
+                f'<line x1="{cx:.3f}" y1="{cy - 2.5:.3f}" '
+                f'x2="{cx:.3f}" y2="{cy + 2.5:.3f}" '
+                'stroke="#7c3aed" stroke-width="0.35"/>\n'
+                f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="0.7" '
+                'fill="none" stroke="#7c3aed" stroke-width="0.25"/>\n')
+
+    # ---- 窗口边界黑框（= 本页原纸窗口四边 / 纸边片段）----
+    parts.append(
+        f'<rect x="{gx:.3f}" y="{gy:.3f}" width="{cw:.3f}" height="{ch:.3f}" '
+        'fill="none" stroke="#1f2937" stroke-width="0.35"/>\n')
+
+    # ---- 顶部留白：页号 / 行列号 ----
+    parts.append(
+        f'<text x="{A4_MARGIN:.3f}" y="6.5" font-size="4.2" '
+        'font-weight="bold" fill="#0f172a">'
+        f'A4 分页定位模板 · 第 {seq} / {total} 页'
+        f'（列 {col}/{paging["cols"]}，行 {row}/{paging["rows"]}，'
+        '行号自下而上）</text>\n')
+
+    # ---- 底部留白：原纸窗口坐标（统一左下角原点，y 向上）----
+    foot_y = A4_H - 2.2
+    parts.append(
+        f'<text x="{A4_MARGIN:.3f}" y="{foot_y:.3f}" font-size="3.2" '
+        f'fill="#475569">原纸 {width:g}×{height:g}mm（原点左下角，y 向上）；'
+        f'本页窗口 x {x0:g}~{x1:g}mm，y {y0:g}~{y1:g}mm；'
+        f'1:1 实际毫米，禁止缩放</text>\n'
+        f'<text x="{A4_MARGIN:.3f}" y="{foot_y - 4.2:.3f}" font-size="3" '
+        f'fill="#64748b">窗口左下角 ({x0:g}, {y0:g})mm，'
+        f'右上角 ({x1:g}, {y1:g})mm；四边留白 {A4_MARGIN:g}mm，'
+        f'标准相邻页重叠 {A4_OVERLAP:g}mm（末窗吸附时底纹可能更宽）；'
+        '紫十字为重叠区对位标记，两页同坐标十字重合即对齐</text>\n')
+
+    # 第 1 页（覆盖原纸左下角）：标出坐标方向与原点（箭头朝 x、y 正向）。
+    # 从角点向内 8mm 起画，整组标记落在纸内，不压窗口黑框。
+    if col == 1 and row == 1:
+        ox, oy = gx + 8.0, gy + ch - 8.0
+        parts.append(
+            '<defs><marker id="arr" markerWidth="5" markerHeight="5" '
+            'refX="4" refY="2.5" orient="auto" markerUnits="strokeWidth">'
+            '<path d="M0,0 L5,2.5 L0,5 Z" fill="#dc2626"/></marker></defs>\n'
+            f'<line x1="{ox:.3f}" y1="{oy:.3f}" x2="{ox + 11:.3f}" '
+            f'y2="{oy:.3f}" stroke="#dc2626" stroke-width="0.4" '
+            'marker-end="url(#arr)"/>\n'
+            f'<line x1="{ox:.3f}" y1="{oy:.3f}" x2="{ox:.3f}" '
+            f'y2="{oy - 11:.3f}" stroke="#dc2626" stroke-width="0.4" '
+            'marker-end="url(#arr)"/>\n'
+            f'<text x="{ox + 12.5:.3f}" y="{oy + 1.2:.3f}" font-size="3.2" '
+            'fill="#dc2626">x</text>\n'
+            f'<text x="{ox - 1.2:.3f}" y="{oy - 12.5:.3f}" font-size="3.2" '
+            'fill="#dc2626">y↑</text>\n'
+            f'<text x="{ox - 1.0:.3f}" y="{oy + 4.0:.3f}" font-size="3" '
+            'fill="#dc2626">O(0,0)</text>\n')
+
+    parts.append('</svg>\n')
+    return "".join(parts)
+
+
+def build_a4_readme(width, height, radius, paging, holes_count):
+    """ZIP 内随附的打印拼接说明（UTF-8 文本）。"""
+    cols, rows = paging["cols"], paging["rows"]
+    lines = [
+        "A4 分页定位模板 —— 打印与拼接说明",
+        "=" * 40,
+        "",
+        f"原纸尺寸：{width:g} × {height:g} mm（坐标原点在原纸左下角，y 轴向上）",
+        f"打孔半径：{radius:g} mm；展开后孔位（重合已合并）：{holes_count} 个",
+        f"分页：共 {len(paging['pages'])} 页 = {cols} 列 × {rows} 行",
+        "（列号从左到右、行号从下到上，第 1 行对应原纸最下一行）",
+        f"页面：纵向 A4 {A4_W:g}×{A4_H:g}mm，四边留白 {A4_MARGIN:g}mm，"
+        f"相邻页标准重叠 {A4_OVERLAP:g}mm",
+        "比例：图形按实际毫米 1:1 绘制，未做任何缩放。",
+        "",
+        "分页规则：窗口从原纸左下角起步，x 向每 175mm、y 向每 262mm 步进",
+        "排列，最后一个窗口吸附到纸张另一边（因此末端相邻页实际重叠可能",
+        "大于 15mm，以浅色重叠带与紫色对位十字为准，对齐方法不变）。",
+        "",
+        "打印要求（务必遵守）",
+        "-" * 40,
+        "1. 使用 A4 纵向纸张单面打印。",
+        "2. 打印缩放必须选择【100% / 实际大小 / 无缩放】，",
+        "   切勿选择“适合页面 / Fit to page”（否则 1:1 尺寸失效）。",
+        "3. 打印后用尺核对：任意一页的纸张窗口黑框宽度应为 "
+        f"{A4_W - 2 * A4_MARGIN:g}mm（不足一页时按实际窗口宽）、"
+        f"高度最大 {A4_H - 2 * A4_MARGIN:g}mm；",
+        "   或核对页内任一孔圆直径/标注尺寸与设定值一致。",
+        "",
+        "拼接方法",
+        "-" * 40,
+        "1. 每页页眉标有页号与行列号，页脚标有本页在原纸上的窗口坐标",
+        "   （x、y 均以原纸左下角为原点，单位 mm）。",
+        "2. 按列从左到右、行从下到上排列页面（文件名中的 r01 即最下一行）。",
+        "3. 相邻页有 15mm 重叠区（蓝/绿浅色带），带内紫色对位十字在两页上",
+        "   对应同一原纸坐标：对齐时让两页的紫色十字完全重合，窗口黑框",
+        "   边线自然落在另一页窗口内 15mm 处，固定后裁掉多余部分即可。",
+        "4. 跨页图形（孔圆、折痕、保护区、纸边）在相邻页各保留窗口内片段，",
+        "   按对位十字拼合后即恢复完整图形，无需也不能拉伸缩放。",
+        "5. 标有 O(0,0) 的一页为原纸左下角页，红箭头分别指向 x、y 正向。",
+        "",
+        "文件清单",
+        "-" * 40,
+        "a4-page-NN-r行-c列.svg：按页号排序（行优先，行内从左到右）。",
+    ]
+    for i, p in enumerate(paging["pages"], 1):
+        lines.append(
+            f"  第 {i:02d} 页 r{p['row']:02d}c{p['col']:02d}："
+            f"窗口 x {p['x0']:g}~{p['x1']:g}mm，"
+            f"y {p['y0']:g}~{p['y1']:g}mm")
+    lines.append("README.txt：本说明。")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_a4_zip(result, width, height, radius, nv, nh, zones):
+    """把合法展开结果打包为 A4 分页 SVG 的 ZIP（内存字节）。"""
+    holes = result["holes"]
+    creases = crease_grid(width, height, nv, nh)
+    paging = a4_windows(width, height)
+    if len(paging["pages"]) > A4_MAX_PAGES:
+        raise ValueError(
+            f"原纸 {width:g}×{height:g}mm 需要 {len(paging['pages'])} 张 A4，"
+            f"超过分页上限 {A4_MAX_PAGES} 张，无法生成 A4 模板。")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        total = len(paging["pages"])
+        for i, page in enumerate(paging["pages"], 1):
+            svg = build_a4_page_svg(page, paging, width, height, holes, creases,
+                                    radius, nv, nh, zones, i, total)
+            name = (f"a4-page-{i:02d}-r{page['row']:02d}c{page['col']:02d}.svg")
+            zf.writestr(name, svg)
+        zf.writestr("README.txt", build_a4_readme(
+            width, height, radius, paging, len(holes)))
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # 请求处理
 # ---------------------------------------------------------------------------
 def _bad(msg, code=400):
@@ -646,6 +1123,17 @@ def compute(payload):
     folded_svg, pad, vb_w, vb_h = build_folded_svg(
         w, h, edges, mm_pts, radius, error_idx)
 
+    # A4 分页窗口只依赖原纸尺寸（折叠面校验通过即可计算）；页数供页面展示，
+    # 模板 ZIP 仅在全部孔位/保护区/纸桥校验通过（error 为空）时才允许下载
+    a4_paging = a4_windows(width, height)
+    a4_info = {
+        "pageCount": len(a4_paging["pages"]),
+        "cols": a4_paging["cols"], "rows": a4_paging["rows"],
+        "pageW": A4_W, "pageH": A4_H,
+        "margin": A4_MARGIN, "overlap": A4_OVERLAP,
+        "pages": a4_paging["pages"],
+    }
+
     return {
         "ok": True,
         "folded": {
@@ -657,9 +1145,11 @@ def compute(payload):
             "svg": folded_svg,
         },
         "creases": creases,
+        "holes": holes,
         "holeCount": len(holes),
         "expectedCount": len(mm_pts) * (2 ** len(folds)),
         "unfoldedSvg": unfolded_svg,
+        "a4Paging": a4_info,
         "error": error_msg,
         "errorIndex": error_idx,
         "zoneError": zone_error,
@@ -990,6 +1480,31 @@ def api_download():
         mimetype="image/svg+xml",
         headers={"Content-Disposition":
                  'attachment; filename="unfolded.svg"'})
+
+
+@app.route("/api/download-a4", methods=["POST"])
+def api_download_a4():
+    """只在展开结果合法（含孔位/保护区/纸桥全部校验）时返回 A4 分页
+    定位模板 ZIP：纵向 A4 1:1 mm，四边留白 10mm、相邻页重叠 15mm。"""
+    payload = request.get_json(force=True, silent=True)
+    if payload is None:
+        return _bad("请求不是合法 JSON")
+    try:
+        result = compute(payload)
+        if result["error"] or not result["unfoldedSvg"]:
+            raise ValueError(result["error"] or "存在不合法孔位，无法生成 A4 分页模板")
+        width, height, radius, folds, _min_bridge = _validate_sheet(payload)
+        zones = _validate_zones(payload)
+        nv = sum(1 for f in folds if f in ("vL", "vR"))
+        nh = len(folds) - nv
+        data = build_a4_zip(result, width, height, radius, nv, nh, zones)
+    except ValueError as exc:
+        return _bad(str(exc))
+    return Response(
+        data,
+        mimetype="application/zip",
+        headers={"Content-Disposition":
+                 'attachment; filename="a4-pages.zip"'})
 
 
 @app.route("/healthz")

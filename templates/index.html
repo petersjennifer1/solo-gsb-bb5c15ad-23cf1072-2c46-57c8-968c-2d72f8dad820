@@ -255,10 +255,12 @@
       </div>
       <div class="toolbar">
         <button type="button" id="btnDownload" class="primary" disabled>下载展开 SVG</button>
+        <button type="button" id="btnDownloadA4" class="primary" disabled>下载 A4 分页模板 (ZIP)</button>
         <button type="button" id="btnReverse"
                 title="在展开图上点击目标孔心，系统按当前折法反查折叠面打孔位置">反查打孔：关</button>
         <span class="hint" id="downloadHint"></span>
       </div>
+      <p class="hint" id="a4Hint"></p>
       <p class="hint" id="reverseHint"></p>
       <div class="toolbar" id="reverseBar" style="display:none">
         <button type="button" id="btnConfirmReverse" class="primary">确认加入打孔点</button>
@@ -441,6 +443,7 @@
       wrap.innerHTML = '<span class="placeholder">存在不合法项，暂不生成展开图</span>';
       $("holeMeta").textContent = "";
       $("downloadHint").textContent = "";
+      $("a4Hint").textContent = "";
       setStatus("err", d.error);
     } else {
       renderUnfolded();
@@ -448,6 +451,14 @@
       var merged = d.holeCount < d.expectedCount;
       $("downloadHint").textContent = merged
         ? "存在重合孔位，已自动只画一次。" : "";
+      // A4 分页模板：按原纸尺寸算出的纵向 A4 页数（1:1 mm，不缩放）
+      var pg = d.a4Paging;
+      $("a4Hint").textContent = pg
+        ? "A4 分页定位模板：共 " + pg.pageCount + " 页（" + pg.cols + " 列 × " +
+          pg.rows + " 行，纵向 A4、1:1 实际毫米、四边留白 " + pg.margin +
+          "mm、相邻页重叠 " + pg.overlap + "mm；含对位十字与窗口坐标，" +
+          "打印时选 100% 比例）。"
+        : "";
       var msg = "展开完成：共 " + d.holeCount + " 个孔";
       if (merged) msg += "（理论 " + d.expectedCount + " 个，重合位置已合并）";
       msg += "。";
@@ -459,8 +470,9 @@
 
   // 排版方案预览期间禁止下载（视图显示的是方案，不是当前打孔点）
   function updateDownloadBtn() {
-    $("btnDownload").disabled =
-      !!planPreview || !lastResult || !!lastResult.error;
+    var blocked = !!planPreview || !lastResult || !!lastResult.error;
+    $("btnDownload").disabled = blocked;
+    $("btnDownloadA4").disabled = blocked;
   }
 
   // 折叠面重绘（含反查预览标记）
@@ -1023,6 +1035,38 @@
         setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
       });
     }).catch(function () { setStatus("err", "下载失败：网络错误。"); });
+  });
+
+  // A4 分页定位模板：服务端复用同一套孔位/保护区/纸桥校验，违规时拒绝打包
+  $("btnDownloadA4").addEventListener("click", function () {
+    if ($("btnDownloadA4").disabled) return;
+    var btn = $("btnDownloadA4");
+    btn.disabled = true;
+    fetch("/api/download-a4", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state)
+    }).then(function (resp) {
+      if (!resp.ok) {
+        btn.disabled = false;
+        return resp.json().then(function (d) {
+          setStatus("err", d.error || "无法生成 A4 分页模板。");
+        });
+      }
+      return resp.blob().then(function (blob) {
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "a4-pages.zip";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+        btn.disabled = false;
+      });
+    }).catch(function () {
+      btn.disabled = false;
+      setStatus("err", "A4 模板下载失败：网络错误。");
+    });
   });
 
   // ---------------- 启动 ----------------
