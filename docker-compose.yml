@@ -1,0 +1,17 @@
+services:
+  paper-fold:
+    build: .
+    image: paper-fold-preview:latest
+    container_name: paper-fold-preview
+    ports:
+      # 宿主机端口:容器端口；如 8000 被占用，改左边即可
+      - "${HOST_PORT:-8000}:${PORT:-8000}"
+    environment:
+      # 容器内监听端口（与右侧端口对应）
+      PORT: "${PORT:-8000}"
+      # 可选限制（默认值见 app.py）
+      MAX_FOLDS: "${MAX_FOLDS:-8}"
+      MAX_HOLES: "${MAX_HOLES:-24}"
+      MAX_ZONES: "${MAX_ZONES:-8}"
+      MAX_TARGETS: "${MAX_TARGETS:-6144}"
+    restart: unless-stopped
